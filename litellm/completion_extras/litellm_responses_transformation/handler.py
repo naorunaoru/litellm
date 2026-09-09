@@ -74,9 +74,42 @@ class ResponsesToCompletionBridgeHandler:
                     existing.setdefault(key, value)
         return response
 
+    @staticmethod
+    def _record_completed_output_item(
+        chunk: object,
+        output_items: dict[int, object],
+    ) -> None:
+        """Keep output items that some Responses backends omit from the terminal envelope."""
+        if isinstance(chunk, dict):
+            event_type = chunk.get("type")
+            item = chunk.get("item")
+            output_index = chunk.get("output_index", 0)
+        else:
+            event_type = getattr(chunk, "type", None)
+            item = getattr(chunk, "item", None)
+            output_index = getattr(chunk, "output_index", 0)
+
+        if event_type != "response.output_item.done" or item is None:
+            return
+        try:
+            index = int(output_index)
+        except (TypeError, ValueError):
+            index = len(output_items)
+        output_items[index] = item
+
+    @staticmethod
+    def _restore_missing_output(
+        response: "ResponsesAPIResponse",
+        output_items: dict[int, object],
+    ) -> None:
+        if response.output or not output_items:
+            return
+        response.output = [output_items[index] for index in sorted(output_items)]  # type: ignore[assignment]
+
     def _collect_response_from_stream(self, stream_iter: Any) -> "ResponsesAPIResponse":
-        for _ in stream_iter:
-            pass
+        output_items: dict[int, object] = {}
+        for chunk in stream_iter:
+            self._record_completed_output_item(chunk, output_items)
 
         completed: Final[object] = getattr(stream_iter, "completed_response", None)
         response_obj: Final[object] = getattr(completed, "response", None) if completed else None
@@ -87,11 +120,13 @@ class ResponsesToCompletionBridgeHandler:
         response: Final = self._coerce_response_object(response_obj, hidden_params)
         if not isinstance(response, ResponsesAPIResponse):
             raise ValueError("Stream completed response is invalid")
+        self._restore_missing_output(response, output_items)
         return response
 
     async def _collect_response_from_stream_async(self, stream_iter: Any) -> "ResponsesAPIResponse":
-        async for _ in stream_iter:
-            pass
+        output_items: dict[int, object] = {}
+        async for chunk in stream_iter:
+            self._record_completed_output_item(chunk, output_items)
 
         completed: Final[object] = getattr(stream_iter, "completed_response", None)
         response_obj: Final[object] = getattr(completed, "response", None) if completed else None
@@ -102,6 +137,7 @@ class ResponsesToCompletionBridgeHandler:
         response: Final = self._coerce_response_object(response_obj, hidden_params)
         if not isinstance(response, ResponsesAPIResponse):
             raise ValueError("Stream completed response is invalid")
+        self._restore_missing_output(response, output_items)
         return response
 
     def validate_input_kwargs(self, kwargs: dict) -> ResponsesToCompletionBridgeHandlerInputKwargs:
