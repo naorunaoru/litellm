@@ -145,8 +145,8 @@ class TestChatGPTResponsesAPITransformation:
                 "metadata": {"foo": "bar"},
                 "max_output_tokens": 123,
                 "stream_options": {"include_usage": True},
-                # supported and should be preserved
                 "truncation": "auto",
+                # supported and should be preserved
                 "previous_response_id": "resp_123",
                 "reasoning": {"effort": "medium"},
                 "tools": [{"type": "function", "function": {"name": "hello"}}],
@@ -164,7 +164,7 @@ class TestChatGPTResponsesAPITransformation:
         assert "max_output_tokens" not in request
         assert "stream_options" not in request
 
-        assert request["truncation"] == "auto"
+        assert "truncation" not in request
         assert request["previous_response_id"] == "resp_123"
         assert request["reasoning"] == {"effort": "medium"}
         assert request["tools"] == [{"type": "function", "function": {"name": "hello"}}]
