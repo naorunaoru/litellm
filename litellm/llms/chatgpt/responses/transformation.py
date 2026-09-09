@@ -76,6 +76,14 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             litellm_params,
             headers,
         )
+        request_input: Final = request.get("input")
+        if isinstance(request_input, list):
+            request["input"] = [
+                {**item, "role": "developer"}
+                if isinstance(item, dict) and item.get("role") == "system"
+                else item
+                for item in request_input
+            ]
         base_instructions: Final = get_chatgpt_default_instructions()
         existing_instructions: Final = request.get("instructions")
         if existing_instructions:

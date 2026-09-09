@@ -41,6 +41,17 @@ class ChatGPTConfig(OpenAIConfig):
             )
         return dynamic_api_base, dynamic_api_key, custom_llm_provider
 
+    def _transform_messages(
+        self,
+        messages: list[AllMessageValues],
+        model: str,
+    ) -> list[AllMessageValues]:
+        normalized_messages: Final = [
+            {**message, "role": "developer"} if message.get("role") == "system" else message
+            for message in messages
+        ]
+        return super()._transform_messages(normalized_messages, model)
+
     def validate_environment(
         self,
         headers: dict,

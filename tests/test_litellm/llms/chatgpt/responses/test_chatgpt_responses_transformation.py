@@ -104,6 +104,24 @@ class TestChatGPTResponsesAPITransformation:
         assert "reasoning.encrypted_content" in request["include"]
         assert request["instructions"].startswith("You are Codex, based on GPT-5.")
 
+    def test_chatgpt_normalizes_system_input_to_developer(self):
+        config = ChatGPTResponsesAPIConfig()
+        request = config.transform_responses_api_request(
+            model="chatgpt/gpt-5.6-sol",
+            input=[
+                {"role": "system", "content": [{"type": "input_text", "text": "Follow the policy"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+            ],
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["input"] == [
+            {"role": "developer", "content": [{"type": "input_text", "text": "Follow the policy"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+        ]
+
     @pytest.mark.parametrize(
         "model_name",
         [
@@ -244,6 +262,43 @@ class TestChatGPTResponsesAPITransformation:
         )
 
         assert parsed.output_text == "Hello from stream!"
+
+    def test_chatgpt_non_stream_sse_response_recovers_output_text_done(self):
+        config = ChatGPTResponsesAPIConfig()
+        response_payload = {
+            "id": "resp_test",
+            "object": "response",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "gpt-6-astra",
+            "output": [],
+        }
+        output_text_done = {
+            "type": "response.output_text.done",
+            "item_id": "msg_test",
+            "output_index": 1,
+            "content_index": 0,
+            "text": "The image contains a mountain.",
+        }
+        sse_body = "\n".join(
+            [
+                f"data: {json.dumps(output_text_done)}",
+                f"data: {json.dumps({'type': 'response.completed', 'response': response_payload})}",
+                "data: [DONE]",
+                "",
+            ]
+        )
+        raw_response = httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, text=sse_body
+        )
+
+        parsed = config.transform_response_api_response(
+            model="chatgpt/gpt-6-astra",
+            raw_response=raw_response,
+            logging_obj=MagicMock(),
+        )
+
+        assert parsed.output_text == "The image contains a mountain."
 
     def test_chatgpt_non_stream_sse_recovers_whitespace_padded_chunks(self):
         """Chunks with leading whitespace before `data:` must still parse.
