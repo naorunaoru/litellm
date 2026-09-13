@@ -32,8 +32,8 @@ class _CompletedEvent:
 
 
 class _FakeResponsesStream:
-    def __init__(self, response):
-        self._emitted = False
+    def __init__(self, response, chunks=None):
+        self._chunks = iter(chunks or [{"type": "response.completed"}])
         self._response = response
         self.completed_response = None
         self._hidden_params = {"headers": {"x-test": "1"}}
@@ -42,11 +42,29 @@ class _FakeResponsesStream:
         return self
 
     def __next__(self):
-        if not self._emitted:
-            self._emitted = True
+        try:
+            return next(self._chunks)
+        except StopIteration:
             self.completed_response = _CompletedEvent(self._response)
-            return {"type": "response.completed"}
-        raise StopIteration
+            raise
+
+
+class _FakeAsyncResponsesStream:
+    def __init__(self, response, chunks):
+        self._chunks = iter(chunks)
+        self._response = response
+        self.completed_response = None
+        self._hidden_params = {"headers": {"x-test": "1"}}
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._chunks)
+        except StopIteration:
+            self.completed_response = _CompletedEvent(self._response)
+            raise StopAsyncIteration
 
 
 def test_should_collect_response_from_stream():
@@ -64,6 +82,62 @@ def test_should_collect_response_from_stream():
 
     assert collected.id == "resp-1"
     assert collected._hidden_params.get("headers") == {"x-test": "1"}
+
+
+def test_should_restore_output_omitted_from_completed_response():
+    handler = ResponsesToCompletionBridgeHandler()
+    response = ResponsesAPIResponse.model_construct(
+        id="resp-1",
+        created_at=0,
+        output=[],
+        object="response",
+        model="gpt-5.2",
+    )
+    message = {
+        "id": "msg-1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": "OK", "annotations": []}],
+    }
+    stream = _FakeResponsesStream(
+        response,
+        chunks=[
+            {"type": "response.output_item.done", "output_index": 0, "item": message},
+            {"type": "response.completed", "response": {"output": []}},
+        ],
+    )
+
+    collected = handler._collect_response_from_stream(stream)
+
+    assert len(collected.output) == 1
+    assert collected.output[0]["content"][0]["text"] == "OK"
+
+
+@pytest.mark.asyncio
+async def test_should_restore_multiple_output_items_async_in_index_order():
+    handler = ResponsesToCompletionBridgeHandler()
+    response = ResponsesAPIResponse.model_construct(
+        id="resp-1",
+        created_at=0,
+        output=[],
+        object="response",
+        model="gpt-5.2",
+    )
+    first = {"id": "msg-1", "type": "message", "content": []}
+    second = {"id": "msg-2", "type": "message", "content": []}
+    stream = _FakeAsyncResponsesStream(
+        response,
+        chunks=[
+            {"type": "response.output_item.done", "output_index": 1, "item": second},
+            {"type": "response.output_item.done", "output_index": 0, "item": first},
+            {"type": "response.completed", "response": {"output": []}},
+        ],
+    )
+
+    collected = await handler._collect_response_from_stream_async(stream)
+
+    assert [item["id"] for item in collected.output] == ["msg-1", "msg-2"]
 
 
 def create_mock_completion_response(

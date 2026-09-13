@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from litellm.exceptions import AuthenticationError
 from litellm.litellm_core_utils.core_helpers import process_response_headers
@@ -23,9 +23,12 @@ from ..authenticator import Authenticator
 from ..common_utils import (
     CHATGPT_API_BASE,
     GetAccessTokenError,
+    derive_chatgpt_session_id,
     ensure_chatgpt_session_id,
     get_chatgpt_default_headers,
     get_chatgpt_default_instructions,
+    get_explicit_chatgpt_session_id,
+    should_derive_chatgpt_session_id,
 )
 
 if TYPE_CHECKING:
@@ -69,23 +72,65 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
         litellm_params: GenericLiteLLMParams,
         headers: dict,
     ) -> dict:
-        request: Final = super().transform_responses_api_request(
-            model,
-            input,
-            response_api_optional_request_params,
-            litellm_params,
-            headers,
+        request: Final[dict[str, object]] = cast(
+            dict[str, object],
+            super().transform_responses_api_request(
+                model,
+                input,
+                response_api_optional_request_params,
+                litellm_params,
+                headers,
+            ),
         )
+        request_input: Final = request.get("input")
+        if isinstance(request_input, list):
+            input_items: Final = cast(list[object], request_input)
+            request["input"] = [
+                {**cast(dict[str, object], item), "role": "developer"}
+                if isinstance(item, dict)
+                and cast(dict[str, object], item).get("role") == "system"
+                else item
+                for item in input_items
+            ]
         base_instructions: Final = get_chatgpt_default_instructions()
         existing_instructions: Final = request.get("instructions")
         if existing_instructions:
-            if base_instructions not in existing_instructions:
+            if isinstance(existing_instructions, str) and base_instructions not in existing_instructions:
                 request["instructions"] = f"{base_instructions}\n\n{existing_instructions}"
         else:
             request["instructions"] = base_instructions
         request["store"] = False
         request["stream"] = True
-        include: Final = list(request.get("include") or [])
+        cache_key_value: Final = request.get("prompt_cache_key")
+        explicit_cache_key: Final = (
+            cache_key_value if isinstance(cache_key_value, str) else None
+        )
+        explicit_session_id: Final = get_explicit_chatgpt_session_id(litellm_params)
+        instruction_value: Final = request.get("instructions")
+        derived_session_id: Final = (
+            derive_chatgpt_session_id(
+                litellm_params,
+                instruction_value if isinstance(instruction_value, str) else None,
+                request.get("input"),
+                model,
+            )
+            if explicit_cache_key is None
+            and explicit_session_id is None
+            and should_derive_chatgpt_session_id(litellm_params)
+            else None
+        )
+        cache_affinity: Final[str | None] = (
+            explicit_cache_key or explicit_session_id or derived_session_id
+        )
+        if cache_affinity is not None:
+            headers["session-id"] = cache_affinity  # mutable-ok: updates the outbound provider header map
+            request["prompt_cache_key"] = cache_affinity
+        include_value: Final = request.get("include")
+        include: Final[list[object]] = (
+            list(cast(list[object], include_value))
+            if isinstance(include_value, list)
+            else []
+        )
         if "reasoning.encrypted_content" not in include:
             include.append("reasoning.encrypted_content")
         request["include"] = include
@@ -99,9 +144,8 @@ class ChatGPTResponsesAPIConfig(OpenAIResponsesAPIConfig):
             "include",
             "tools",
             "tool_choice",
+            "prompt_cache_key",
             "reasoning",
-            "previous_response_id",
-            "truncation",
         }
 
         return {k: v for k, v in request.items() if k in allowed_keys}

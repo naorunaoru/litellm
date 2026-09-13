@@ -1,4 +1,4 @@
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from litellm.exceptions import AuthenticationError
 from litellm.llms.openai.openai import OpenAIConfig
@@ -40,6 +40,19 @@ class ChatGPTConfig(OpenAIConfig):
                 message=str(e),
             )
         return dynamic_api_base, dynamic_api_key, custom_llm_provider
+
+    def _transform_messages(
+        self,
+        messages: list[AllMessageValues],
+        model: str,
+    ) -> list[AllMessageValues]:
+        normalized_messages: Final[list[AllMessageValues]] = [
+            cast(AllMessageValues, {**message, "role": "developer"})
+            if cast(dict[str, object], message).get("role") == "system"
+            else message
+            for message in messages
+        ]
+        return super()._transform_messages(normalized_messages, model)
 
     def validate_environment(
         self,

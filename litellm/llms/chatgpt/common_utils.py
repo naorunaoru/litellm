@@ -2,9 +2,13 @@
 Constants and helpers for ChatGPT subscription OAuth.
 """
 
+import json
 import os
 import platform
-from typing import Any, Final
+from collections.abc import Callable, Mapping
+from hashlib import sha256
+from hmac import new as new_hmac
+from typing import Final, cast
 from uuid import uuid4
 
 import httpx
@@ -240,7 +244,7 @@ def get_chatgpt_default_headers(
         "user-agent": user_agent,
     }
     if session_id:
-        headers["session_id"] = session_id
+        headers["session-id"] = session_id
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
     return headers
@@ -250,25 +254,37 @@ def get_chatgpt_default_instructions() -> str:
     return os.getenv("CHATGPT_DEFAULT_INSTRUCTIONS") or CHATGPT_DEFAULT_INSTRUCTIONS
 
 
-def _normalize_litellm_params(litellm_params: Any | None) -> dict:
+def _normalize_litellm_params(
+    litellm_params: object | None,
+) -> Mapping[str, object]:
     if litellm_params is None:
         return {}
     if isinstance(litellm_params, dict):
-        return litellm_params
-    if hasattr(litellm_params, "model_dump"):
+        return cast(dict[str, object], litellm_params)
+    model_dump: Final = cast(
+        Callable[[], object] | None,
+        getattr(litellm_params, "model_dump", None),
+    )
+    if model_dump is not None:
         try:
-            return litellm_params.model_dump()
+            model_values: Final = model_dump()
+            return cast(dict[str, object], model_values) if isinstance(model_values, dict) else {}
         except Exception:
             return {}
-    if hasattr(litellm_params, "dict"):
+    legacy_dict: Final = cast(
+        Callable[[], object] | None,
+        getattr(litellm_params, "dict", None),
+    )
+    if legacy_dict is not None:
         try:
-            return litellm_params.dict()
+            legacy_values: Final = legacy_dict()
+            return cast(dict[str, object], legacy_values) if isinstance(legacy_values, dict) else {}
         except Exception:
             return {}
     return {}
 
 
-def get_chatgpt_session_id(litellm_params: Any | None) -> str | None:
+def get_explicit_chatgpt_session_id(litellm_params: object | None) -> str | None:
     params: Final = _normalize_litellm_params(litellm_params)
     for key in ("litellm_session_id", "session_id"):
         value = params.get(key)
@@ -276,9 +292,17 @@ def get_chatgpt_session_id(litellm_params: Any | None) -> str | None:
             return str(value)
     metadata: Final = params.get("metadata")
     if isinstance(metadata, dict):
-        value = metadata.get("session_id")
+        value = cast(dict[str, object], metadata).get("session_id")
         if value:
             return str(value)
+    return None
+
+
+def get_chatgpt_session_id(litellm_params: object | None) -> str | None:
+    explicit_session_id: Final = get_explicit_chatgpt_session_id(litellm_params)
+    if explicit_session_id is not None:
+        return explicit_session_id
+    params: Final = _normalize_litellm_params(litellm_params)
     for key in ("litellm_trace_id", "litellm_call_id"):
         value = params.get(key)
         if value:
@@ -286,5 +310,48 @@ def get_chatgpt_session_id(litellm_params: Any | None) -> str | None:
     return None
 
 
-def ensure_chatgpt_session_id(litellm_params: Any | None) -> str:
+def ensure_chatgpt_session_id(litellm_params: object | None) -> str:
     return get_chatgpt_session_id(litellm_params) or str(uuid4())
+
+
+def should_derive_chatgpt_session_id(litellm_params: object | None) -> bool:
+    value: Final = _normalize_litellm_params(litellm_params).get("chatgpt_derive_session_id")
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no", "off"}
+    return value is not False
+
+
+def _get_tenant_from_metadata(metadata: object) -> str | None:
+    if not isinstance(metadata, dict):
+        return None
+    tenant: Final = cast(dict[str, object], metadata).get("user_api_key_hash")
+    return str(tenant) if tenant else None
+
+
+def _get_authenticated_tenant(litellm_params: object | None) -> str | None:
+    params: Final = _normalize_litellm_params(litellm_params)
+    metadata_values: Final = (params.get("litellm_metadata"), params.get("metadata"))
+    return next(
+        (tenant for metadata in metadata_values if (tenant := _get_tenant_from_metadata(metadata))),
+        None,
+    )
+
+
+def derive_chatgpt_session_id(
+    litellm_params: object | None,
+    instructions: str | None,
+    input: object,
+    model: str,
+) -> str | None:
+    tenant: Final = _get_authenticated_tenant(litellm_params)
+    salt: Final = os.getenv("LITELLM_SALT_KEY")
+    if tenant is None or salt is None:
+        return None
+    first_item: Final[object] = (
+        cast(list[object], input)[0]
+        if isinstance(input, list) and input
+        else cast(object, input)
+    )
+    anchor: Final = json.dumps(("v1", tenant, model, instructions or "", first_item), sort_keys=True, default=str)
+    digest: Final = new_hmac(salt.encode(), anchor.encode(), sha256).hexdigest()[:32]
+    return f"litellm-derived-v1-{digest}"

@@ -3,7 +3,7 @@ Handler for transforming /chat/completions api requests to litellm.responses req
 """
 
 from collections.abc import Coroutine
-from typing import TYPE_CHECKING, Any, Final, Union
+from typing import TYPE_CHECKING, Any, Final, Union, cast
 
 from typing_extensions import TypedDict
 
@@ -74,9 +74,61 @@ class ResponsesToCompletionBridgeHandler:
                     existing.setdefault(key, value)
         return response
 
+    @staticmethod
+    def _get_output_item_event_values(chunk: object) -> tuple[object, object, object]:
+        if isinstance(chunk, dict):
+            event: Final = cast(dict[str, object], chunk)
+            return (
+                event.get("type"),
+                event.get("item"),
+                event.get("output_index", 0),
+            )
+        return (
+            cast(object, getattr(chunk, "type", None)),
+            cast(object, getattr(chunk, "item", None)),
+            cast(object, getattr(chunk, "output_index", 0)),
+        )
+
+    @staticmethod
+    def _coerce_output_index(value: object, fallback: int) -> int:
+        if not isinstance(value, (str, bytes, bytearray, int)):
+            return fallback
+        try:
+            return int(value)
+        except ValueError:
+            return fallback
+
+    @staticmethod
+    def _record_completed_output_item(
+        chunk: object,
+        output_items: dict[int, object],
+    ) -> None:
+        event_type, item, output_index = (
+            ResponsesToCompletionBridgeHandler._get_output_item_event_values(chunk)
+        )
+
+        if event_type != "response.output_item.done" or item is None:
+            return
+        index: Final = ResponsesToCompletionBridgeHandler._coerce_output_index(
+            output_index,
+            len(output_items),
+        )
+        output_items[index] = item
+
+    @staticmethod
+    def _restore_missing_output(
+        response: "ResponsesAPIResponse",
+        output_items: dict[int, object],
+    ) -> "ResponsesAPIResponse":
+        if response.output or not output_items:
+            return response
+        output: Final = [output_items[index] for index in sorted(output_items)]
+        return response.model_copy(update={"output": output})
+
     def _collect_response_from_stream(self, stream_iter: Any) -> "ResponsesAPIResponse":
-        for _ in stream_iter:
-            pass
+        output_items: dict[int, object] = {}
+        for chunk_value in stream_iter:
+            self._record_completed_output_item(cast(object, chunk_value), output_items)
 
         completed: Final = getattr(stream_iter, "completed_response", None)
         response_obj: Final = getattr(completed, "response", None) if completed else None
@@ -87,11 +139,12 @@ class ResponsesToCompletionBridgeHandler:
         response: Final = self._coerce_response_object(response_obj, hidden_params)
         if not isinstance(response, ResponsesAPIResponse):
             raise ValueError("Stream completed response is invalid")
-        return response
+        return self._restore_missing_output(response, output_items)
 
     async def _collect_response_from_stream_async(self, stream_iter: Any) -> "ResponsesAPIResponse":
-        async for _ in stream_iter:
-            pass
+        output_items: dict[int, object] = {}
+        async for chunk_value in stream_iter:
+            self._record_completed_output_item(cast(object, chunk_value), output_items)
 
         completed: Final = getattr(stream_iter, "completed_response", None)
         response_obj: Final = getattr(completed, "response", None) if completed else None
@@ -102,7 +155,7 @@ class ResponsesToCompletionBridgeHandler:
         response: Final = self._coerce_response_object(response_obj, hidden_params)
         if not isinstance(response, ResponsesAPIResponse):
             raise ValueError("Stream completed response is invalid")
-        return response
+        return self._restore_missing_output(response, output_items)
 
     def validate_input_kwargs(self, kwargs: dict) -> ResponsesToCompletionBridgeHandlerInputKwargs:
         from litellm import LiteLLMLoggingObj

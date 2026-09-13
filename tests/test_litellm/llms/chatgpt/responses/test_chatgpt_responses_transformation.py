@@ -81,7 +81,72 @@ class TestChatGPTResponsesAPITransformation:
         assert headers["originator"] == "custom-origin"
         assert headers["content-type"] == "application/json"
         assert headers["accept"] == "text/event-stream"
-        assert headers["session_id"] == "session-123"
+        assert headers["session-id"] == "session-123"
+        assert "session_id" not in headers
+
+    @patch("litellm.llms.chatgpt.responses.transformation.Authenticator")
+    def test_derived_cache_affinity_reaches_header_and_body(self, mock_authenticator_class, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt")
+        mock_auth_instance = MagicMock()
+        mock_auth_instance.get_access_token.return_value = "access-123"
+        mock_auth_instance.get_account_id.return_value = "acct-123"
+        mock_authenticator_class.return_value = mock_auth_instance
+        config = ChatGPTResponsesAPIConfig()
+        litellm_params = GenericLiteLLMParams(
+            litellm_metadata={"user_api_key_hash": "tenant-a"},
+        )
+        headers = config.validate_environment(headers={}, model="gpt-5.6-sol", litellm_params=litellm_params)
+
+        request = config.transform_responses_api_request(
+            model="gpt-5.6-sol",
+            input=[{"role": "user", "content": "shared prefix"}],
+            response_api_optional_request_params={},
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
+        assert headers["session-id"].startswith("litellm-derived-v1-")
+        assert request["prompt_cache_key"] == headers["session-id"]
+
+    def test_explicit_prompt_cache_key_wins_over_session_and_derived_values(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt")
+        config = ChatGPTResponsesAPIConfig()
+        litellm_params = GenericLiteLLMParams(
+            litellm_session_id="explicit-session",
+            litellm_metadata={"user_api_key_hash": "tenant-a"},
+        )
+        headers = {"session-id": "generated-session"}
+
+        request = config.transform_responses_api_request(
+            model="gpt-5.6-sol",
+            input="shared prefix",
+            response_api_optional_request_params={"prompt_cache_key": "explicit-cache"},
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
+        assert headers["session-id"] == "explicit-cache"
+        assert request["prompt_cache_key"] == "explicit-cache"
+
+    def test_explicit_session_wins_over_derived_value(self, monkeypatch):
+        monkeypatch.setenv("LITELLM_SALT_KEY", "test-salt")
+        config = ChatGPTResponsesAPIConfig()
+        litellm_params = GenericLiteLLMParams(
+            litellm_session_id="explicit-session",
+            litellm_metadata={"user_api_key_hash": "tenant-a"},
+        )
+        headers = {"session-id": "generated-session"}
+
+        request = config.transform_responses_api_request(
+            model="gpt-5.6-sol",
+            input="shared prefix",
+            response_api_optional_request_params={},
+            litellm_params=litellm_params,
+            headers=headers,
+        )
+
+        assert headers["session-id"] == "explicit-session"
+        assert request["prompt_cache_key"] == "explicit-session"
 
     @pytest.mark.parametrize(
         "model_name",
@@ -103,6 +168,28 @@ class TestChatGPTResponsesAPITransformation:
         assert request["stream"] is True
         assert "reasoning.encrypted_content" in request["include"]
         assert request["instructions"].startswith("You are Codex, based on GPT-5.")
+
+    def test_chatgpt_normalizes_top_level_system_input_to_developer(self):
+        config = ChatGPTResponsesAPIConfig()
+        nested_payload = {"role": "system", "value": "preserve me"}
+        request = config.transform_responses_api_request(
+            model="chatgpt/gpt-5.6-sol",
+            input=[
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": "Follow the policy"}],
+                    "metadata": nested_payload,
+                },
+                {"role": "user", "content": [{"type": "input_text", "text": "Hello"}]},
+            ],
+            response_api_optional_request_params={},
+            litellm_params=GenericLiteLLMParams(),
+            headers={},
+        )
+
+        assert request["input"][0]["role"] == "developer"
+        assert request["input"][0]["metadata"] == nested_payload
+        assert request["input"][1]["role"] == "user"
 
     @pytest.mark.parametrize(
         "model_name",
@@ -130,6 +217,7 @@ class TestChatGPTResponsesAPITransformation:
                 # supported and should be preserved
                 "truncation": "auto",
                 "previous_response_id": "resp_123",
+                "prompt_cache_key": "conversation-123",
                 "reasoning": {"effort": "medium"},
                 "tools": [{"type": "function", "function": {"name": "hello"}}],
                 "tool_choice": {"type": "function", "function": {"name": "hello"}},
@@ -146,8 +234,9 @@ class TestChatGPTResponsesAPITransformation:
         assert "max_output_tokens" not in request
         assert "stream_options" not in request
 
-        assert request["truncation"] == "auto"
-        assert request["previous_response_id"] == "resp_123"
+        assert "truncation" not in request
+        assert "previous_response_id" not in request
+        assert request["prompt_cache_key"] == "conversation-123"
         assert request["reasoning"] == {"effort": "medium"}
         assert request["tools"] == [{"type": "function", "function": {"name": "hello"}}]
         assert request["tool_choice"] == {
